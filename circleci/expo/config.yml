@@ -1,0 +1,269 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@5.1.0
+
+# ===============================================================
+# GLOBAL DEFAULTS
+# ===============================================================
+
+defaults: &defaults
+  working_directory: ~/repo
+  environment:
+    NODE_ENV: production
+    EXPO_NO_TELEMETRY: "1"
+    EAS_NO_VCS: "1"
+    YARN_CACHE_FOLDER: .yarn-cache
+    APP_PATH: apps/mobile   # 🔁 CHANGE if your app is elsewhere
+
+# ===============================================================
+# JOBS
+# ===============================================================
+
+jobs:
+
+# ===============================================================
+# INSTALL DEPENDENCIES
+# ===============================================================
+
+  install:
+    docker:
+      - image: cimg/node:20.17
+    <<: *defaults
+
+    steps:
+      - run:
+          name: Checkout Repository
+          command: |
+            mkdir -p ~/repo
+            cd ~/repo
+            git clone https://oauth2:$GIT_TOKEN@$GIT_REPO_URL .
+            git checkout $CIRCLE_BRANCH
+
+      - restore_cache:
+          keys:
+            - yarn-cache-{{ checksum "yarn.lock" }}
+            - yarn-cache-
+
+      - run:
+          name: Install Dependencies
+          command: |
+            yarn install --immutable
+
+      - save_cache:
+          key: yarn-cache-{{ checksum "yarn.lock" }}
+          paths:
+            - .yarn-cache/
+            - node_modules/
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+# ===============================================================
+# VERSION BUMP (OPTIONAL)
+# ===============================================================
+
+  version_bump:
+    docker:
+      - image: cimg/node:20.17
+    <<: *defaults
+
+    steps:
+      - attach_workspace:
+          at: .
+
+      - run:
+          name: Run Version Bump Script
+          command: |
+            cd $APP_PATH
+            if [ -f scripts/bump-version.js ]; then
+              node scripts/bump-version.js
+            else
+              echo "No bump script found — skipping"
+            fi
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+# ===============================================================
+# ANDROID BUILD + SUBMIT
+# ===============================================================
+
+  build_and_submit_android:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: large
+    <<: *defaults
+
+    steps:
+      - attach_workspace:
+          at: .
+
+      - run:
+          name: Login to Expo
+          command: echo $EXPO_TOKEN | npx eas whoami
+
+      - run:
+          name: Setup Android SDK
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y openjdk-17-jdk ninja-build cmake
+
+            export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+            export PATH=$JAVA_HOME/bin:$PATH
+            echo "JAVA_HOME=$JAVA_HOME" >> $BASH_ENV
+
+            mkdir -p $HOME/android-sdk/cmdline-tools
+            cd $HOME/android-sdk
+
+            wget https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q commandlinetools-linux-11076708_latest.zip
+
+            mkdir -p cmdline-tools/latest
+            mv cmdline-tools/* cmdline-tools/latest/
+
+            export ANDROID_HOME=$HOME/android-sdk
+            export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
+
+            echo "ANDROID_HOME=$ANDROID_HOME" >> $BASH_ENV
+            echo "PATH=$PATH" >> $BASH_ENV
+
+            yes | sdkmanager --licenses || true
+
+            sdkmanager "platform-tools" \
+                       "platforms;android-33" \
+                       "build-tools;33.0.2"
+
+            cd ~/repo
+            echo "sdk.dir=$ANDROID_HOME" > $APP_PATH/android/local.properties
+
+      - run:
+          name: Inject Environment (.env.local → .env)
+          command: |
+            if [ -f .env.local ]; then
+              cp .env.local $APP_PATH/.env.local
+              cp .env.local $APP_PATH/.env
+            fi
+
+      - run:
+          name: Local Android Build
+          command: |
+            cd $APP_PATH
+            npx eas build -p android --local --non-interactive --clear-cache
+
+      - run:
+          name: Submit to Play Store
+          command: |
+            cd $APP_PATH
+            AAB_FILE=$(ls *.aab | head -n 1)
+            npx eas submit -p android \
+              --path "./$AAB_FILE" \
+              --non-interactive
+
+      - store_artifacts:
+          path: apps
+
+# ===============================================================
+# IOS BUILD + SUBMIT
+# ===============================================================
+
+  build_and_submit_ios:
+    macos:
+      xcode: 15.4.0
+    resource_class: m4pro.medium
+    <<: *defaults
+
+    steps:
+      - attach_workspace:
+          at: .
+
+      - run:
+          name: Login to Expo
+          command: echo $EXPO_TOKEN | npx eas whoami
+
+      - run:
+          name: Inject Environment (.env.local → .env)
+          command: |
+            if [ -f .env.local ]; then
+              cp .env.local $APP_PATH/.env.local
+              cp .env.local $APP_PATH/.env
+            fi
+
+      - run:
+          name: Local iOS Build
+          command: |
+            cd $APP_PATH
+            rm -rf .eas ios-build ios-metadata || true
+            npx eas build -p ios --local --non-interactive --clear-cache
+
+      - run:
+          name: Submit to TestFlight
+          command: |
+            cd $APP_PATH
+            IPA_FILE=$(ls *.ipa | head -n 1)
+            npx eas submit -p ios \
+              --path "./$IPA_FILE" \
+              --non-interactive
+
+      - store_artifacts:
+          path: apps
+
+# ===============================================================
+# OPTIONAL VERSION COMMIT
+# ===============================================================
+
+  version_commit:
+    docker:
+      - image: cimg/node:20.17
+    <<: *defaults
+
+    steps:
+      - attach_workspace:
+          at: .
+
+      - run:
+          name: Commit Version Changes
+          command: |
+            git config --global user.email "ci@circleci.com"
+            git config --global user.name "CircleCI"
+
+            git add $APP_PATH/app.config.*
+            git restore $APP_PATH/.env || true
+
+            if git diff --cached --quiet; then
+              echo "No version change"
+              exit 0
+            fi
+
+            git commit -m "chore: bump version [skip ci]"
+            git push https://oauth2:$GIT_TOKEN@$GIT_REPO_URL HEAD:$CIRCLE_BRANCH
+
+# ===============================================================
+# WORKFLOW
+# ===============================================================
+
+workflows:
+  build_and_release:
+    jobs:
+      - install
+
+      - version_bump:
+          requires:
+            - install
+
+      - build_and_submit_android:
+          requires:
+            - version_bump
+
+      - build_and_submit_ios:
+          requires:
+            - version_bump
+
+      - version_commit:
+          requires:
+            - build_and_submit_android
+            - build_and_submit_ios
